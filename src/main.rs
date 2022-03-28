@@ -4,6 +4,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::cmp;
+use std::env;
 use std::fs;
 use std::io;
 use tui::{
@@ -22,7 +23,8 @@ fn main() -> Result<(), io::Error> {
     execute!(backend, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(backend)?;
 
-    let buffer = fs::read_to_string("test")?;
+    let args: Vec<String> = env::args().collect();
+    let buffer = fs::read_to_string(&args[1])?;
     let mut buf: Vec<String> = buffer.lines().map(|x| x.to_string()).collect();
 
     let mut cursor_row: usize = 0;
@@ -168,7 +170,7 @@ fn main() -> Result<(), io::Error> {
         }
     }
 
-    fs::write("test2", buf.join("\n"))?;
+    fs::write(&args[1], buf.join("\n"))?;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
