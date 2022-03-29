@@ -31,7 +31,8 @@ fn main() -> Result<(), io::Error> {
     let mut cursor_col: usize = 0;
 
     let mut v_scroll = 0;
-    let v_scroll_max = terminal.size()?.height as usize - 2;
+    let v_scroll_max = terminal.size()?.height as usize - 2; // Should be in loop in case of resizing
+    let width = terminal.size()?.width;
 
     loop {
         terminal.draw(|f| {
@@ -46,9 +47,16 @@ fn main() -> Result<(), io::Error> {
             let line_numbers_width = (buffer.lines().count() as f32).log10() as usize + 2;
             let mut lines_with_nums: Vec<Vec<String>> = vec![];
             for i in v_scroll..buf.len() {
+                let overflow_indicator =
+                    if buf[i].len() > width as usize - 2 - line_numbers_width - 2 - 2 {
+                        ">>".to_string()
+                    } else {
+                        "".to_string()
+                    };
                 lines_with_nums.push(vec![
                     format!("{:>line_numbers_width$}", i + 1),
                     buf[i].clone(),
+                    overflow_indicator,
                 ]);
             }
             let rows = lines_with_nums.into_iter().map(|x| Row::new(x));
@@ -62,7 +70,8 @@ fn main() -> Result<(), io::Error> {
                 Table::new(rows)
                     .widths(&[
                         Constraint::Length(line_numbers_width as u16),
-                        Constraint::Percentage(100),
+                        Constraint::Length(width - 2 - line_numbers_width as u16 - 2 - 2),
+                        Constraint::Min(2),
                     ])
                     .column_spacing(1)
                     .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
