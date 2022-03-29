@@ -45,8 +45,6 @@ fn main() -> Result<(), io::Error> {
 
             let line_numbers_width = (buffer.lines().count() as f32).log10() as usize + 2;
             let mut lines_with_nums: Vec<Vec<String>> = vec![];
-            // for i in 0..buf.len() {
-            // for i in v_scroll..cmp::min(buf.len(), v_scroll_max) {
             for i in v_scroll..buf.len() {
                 lines_with_nums.push(vec![
                     format!("{:>line_numbers_width$}", i + 1),
@@ -82,10 +80,9 @@ fn main() -> Result<(), io::Error> {
                 KeyCode::Up => {
                     if cursor_row > 0 {
                         cursor_row -= 1;
-                        cursor_col = cmp::min(cursor_col, buf[cursor_row].len());
-                        // } else if cursor_row == v_scroll && cursor_row > 0 {
+                        cursor_col = cmp::min(cursor_col, buf[cursor_row + v_scroll].len());
                     } else if v_scroll > 0 {
-                        cursor_col = cmp::min(cursor_col, buf[cursor_row].len());
+                        cursor_col = cmp::min(cursor_col, buf[cursor_row + v_scroll].len());
                         v_scroll -= 1;
                     }
                 }
@@ -107,48 +104,64 @@ fn main() -> Result<(), io::Error> {
                     }
                 }
                 KeyCode::Right => {
-                    if cursor_col < buf[cursor_row].len() {
+                    if cursor_col < buf[cursor_row + v_scroll].len() {
                         cursor_col += 1;
                     }
                 }
                 KeyCode::Backspace => {
                     if cursor_col > 0 {
                         let line: Vec<&str> =
-                            UnicodeSegmentation::graphemes(&buf[cursor_row][..], true).collect();
+                            UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
+                                .collect();
                         let p1 = &line[..cursor_col - 1].join("");
                         let p2 = &line[cursor_col..].join("");
-                        buf[cursor_row] = p1.to_string() + p2;
+                        buf[cursor_row + v_scroll] = p1.to_string() + p2;
 
                         cursor_col -= 1;
-                    } else if cursor_col == 0 && cursor_row > 0 && buf[cursor_row].len() == 0 {
-                        buf.remove(cursor_row);
+                    } else if cursor_col == 0
+                        && cursor_row + v_scroll > 0
+                        && buf[cursor_row + v_scroll].len() == 0
+                    {
+                        buf.remove(cursor_row + v_scroll);
                         cursor_row -= 1;
-                        cursor_col = buf[cursor_row].len();
-                    } else if cursor_col == 0 && cursor_row > 0 {
-                        let p = &buf[cursor_row].clone();
-                        cursor_col = UnicodeSegmentation::graphemes(&buf[cursor_row - 1][..], true)
-                            .collect::<Vec<&str>>()
-                            .len();
-                        buf[cursor_row - 1].push_str(p);
-                        buf.remove(cursor_row);
+                        cursor_col = buf[cursor_row + v_scroll].len();
+                    } else if cursor_col == 0 && cursor_row + v_scroll > 0 {
+                        let p = &buf[cursor_row + v_scroll].clone();
+                        cursor_col = UnicodeSegmentation::graphemes(
+                            &buf[cursor_row + v_scroll - 1][..],
+                            true,
+                        )
+                        .collect::<Vec<&str>>()
+                        .len();
+                        buf[cursor_row + v_scroll - 1].push_str(p);
+                        buf.remove(cursor_row + v_scroll);
                         cursor_row -= 1;
                     }
                 }
                 KeyCode::Enter => {
-                    if cursor_col == buf[cursor_row].len() {
-                        buf.insert(cursor_row + 1, "".to_string());
-                        cursor_row += 1;
+                    if cursor_col == buf[cursor_row + v_scroll].len() {
+                        buf.insert(cursor_row + 1 + v_scroll, "".to_string());
+                        if cursor_row < v_scroll_max - 1 {
+                            cursor_row += 1;
+                        } else {
+                            v_scroll += 1;
+                        }
                         cursor_col = 0;
                     } else {
                         let line: Vec<&str> =
-                            UnicodeSegmentation::graphemes(&buf[cursor_row][..], true).collect();
+                            UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
+                                .collect();
                         let p1 = &line[..cursor_col].join("");
                         let p2 = &line[cursor_col..].join("");
 
-                        buf.insert(cursor_row + 1, p2.to_string());
-                        buf.insert(cursor_row + 1, p1.to_string());
-                        buf.remove(cursor_row);
-                        cursor_row += 1;
+                        buf.insert(cursor_row + 1 + v_scroll, p2.to_string());
+                        buf.insert(cursor_row + 1 + v_scroll, p1.to_string());
+                        buf.remove(cursor_row + v_scroll);
+                        if cursor_row < v_scroll_max - 1 {
+                            cursor_row += 1;
+                        } else {
+                            v_scroll += 1;
+                        }
                         cursor_col = 0;
                     }
                 }
@@ -158,11 +171,12 @@ fn main() -> Result<(), io::Error> {
                     };
 
                     let line: Vec<&str> =
-                        UnicodeSegmentation::graphemes(&buf[cursor_row][..], true).collect();
+                        UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
+                            .collect();
                     let p1 = &line[..cursor_col].join("");
                     let p2 = &line[cursor_col..].join("");
                     let p: String = p1.to_string() + &c.to_string() + p2;
-                    buf[cursor_row] = p;
+                    buf[cursor_row + v_scroll] = p;
                     cursor_col += 1;
                 }
                 _ => continue,
