@@ -26,13 +26,16 @@ fn main() -> Result<(), io::Error> {
     let args: Vec<String> = env::args().collect();
     let buffer = fs::read_to_string(&args[1])?;
     let mut buf: Vec<String> = buffer.lines().map(|x| x.to_string()).collect();
+    let mut bufs: Vec<Vec<String>> = vec![];
 
     let mut cursor_row: usize = 0;
     let mut cursor_col: usize = 0;
 
     let mut v_scroll = 0;
     let v_scroll_max = terminal.size()?.height as usize - 2; // Should be in loop in case of resizing
-    let width = terminal.size()?.width;
+    let term_width = terminal.size()?.width;
+
+    let mut writing = false;
 
     loop {
         terminal.draw(|f| {
@@ -48,7 +51,7 @@ fn main() -> Result<(), io::Error> {
             let mut lines_with_nums: Vec<Vec<String>> = vec![];
             for i in v_scroll..buf.len() {
                 let overflow_indicator =
-                    if buf[i].len() > width as usize - 2 - line_numbers_width - 2 - 2 {
+                    if buf[i].len() > term_width as usize - 2 - line_numbers_width - 2 - 2 {
                         ">>".to_string()
                     } else {
                         "".to_string()
@@ -70,7 +73,7 @@ fn main() -> Result<(), io::Error> {
                 Table::new(rows)
                     .widths(&[
                         Constraint::Length(line_numbers_width as u16),
-                        Constraint::Length(width - 2 - line_numbers_width as u16 - 2 - 2),
+                        Constraint::Length(term_width - 2 - line_numbers_width as u16 - 2 - 2),
                         Constraint::Min(2),
                     ])
                     .column_spacing(1)
@@ -119,6 +122,8 @@ fn main() -> Result<(), io::Error> {
                 }
                 KeyCode::Backspace => {
                     if cursor_col > 0 {
+                        bufs.push(buf.clone());
+
                         let line: Vec<&str> =
                             UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
                                 .collect();
@@ -131,10 +136,12 @@ fn main() -> Result<(), io::Error> {
                         && cursor_row + v_scroll > 0
                         && buf[cursor_row + v_scroll].len() == 0
                     {
+                        bufs.push(buf.clone());
                         buf.remove(cursor_row + v_scroll);
                         cursor_row -= 1;
                         cursor_col = buf[cursor_row + v_scroll].len();
                     } else if cursor_col == 0 && cursor_row + v_scroll > 0 {
+                        bufs.push(buf.clone());
                         let p = &buf[cursor_row + v_scroll].clone();
                         cursor_col = UnicodeSegmentation::graphemes(
                             &buf[cursor_row + v_scroll - 1][..],
@@ -149,6 +156,7 @@ fn main() -> Result<(), io::Error> {
                 }
                 KeyCode::Enter => {
                     if cursor_col == buf[cursor_row + v_scroll].len() {
+                        bufs.push(buf.clone());
                         buf.insert(cursor_row + 1 + v_scroll, "".to_string());
                         if cursor_row < v_scroll_max - 1 {
                             cursor_row += 1;
@@ -157,6 +165,7 @@ fn main() -> Result<(), io::Error> {
                         }
                         cursor_col = 0;
                     } else {
+                        bufs.push(buf.clone());
                         let line: Vec<&str> =
                             UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
                                 .collect();
@@ -176,24 +185,33 @@ fn main() -> Result<(), io::Error> {
                 }
                 KeyCode::Char(c) => {
                     if _m == KeyModifiers::CONTROL && c == 's' {
+                        writing = true;
                         break;
-                    };
-
-                    let line: Vec<&str> =
-                        UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
-                            .collect();
-                    let p1 = &line[..cursor_col].join("");
-                    let p2 = &line[cursor_col..].join("");
-                    let p: String = p1.to_string() + &c.to_string() + p2;
-                    buf[cursor_row + v_scroll] = p;
-                    cursor_col += 1;
+                    } else if _m == KeyModifiers::CONTROL && c == 'z' {
+                        match bufs.pop() {
+                            Some(x) => buf = x,
+                            None => (),
+                        }
+                    } else {
+                        bufs.push(buf.clone());
+                        let line: Vec<&str> =
+                            UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
+                                .collect();
+                        let p1 = &line[..cursor_col].join("");
+                        let p2 = &line[cursor_col..].join("");
+                        let p: String = p1.to_string() + &c.to_string() + p2;
+                        buf[cursor_row + v_scroll] = p;
+                        cursor_col += 1;
+                    }
                 }
                 _ => continue,
             }
         }
     }
 
-    fs::write(&args[1], buf.join("\n"))?;
+    if writing {
+        fs::write(&args[1], buf.join("\n"))?;
+    }
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
