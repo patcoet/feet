@@ -3,10 +3,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::cmp;
-use std::env;
-use std::fs;
-use std::io;
+use std::{cmp, env, error::Error, fs, io};
 use tui::{
     backend::CrosstermBackend,
     layout::Constraint,
@@ -17,26 +14,190 @@ use tui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-fn main() -> Result<(), io::Error> {
+struct BufState {
+    buf: Vec<String>,
+    buf_hist: Vec<Vec<String>>,
+    c_row: usize, // Cursor row
+    c_col: usize,
+    scrolled: usize,
+    c_hist: Vec<(usize, usize, usize)>,
+    c_row_max: usize,
+}
+
+impl BufState {
+    fn adjust_col(&mut self) {
+        self.c_col = cmp::min(self.c_col, self.buf[self.c_row + self.scrolled].len());
+    }
+
+    fn push_hists(&mut self) {
+        self.buf_hist.push(self.buf.clone());
+        self.c_hist.push((self.c_col, self.c_row, self.scrolled));
+    }
+
+    fn move_cursor_up(&mut self, amount: usize) {
+        if self.c_row >= amount {
+            self.c_row -= amount;
+            self.adjust_col();
+        } else if self.scrolled + self.c_row >= amount {
+            self.scrolled -= cmp::min(amount - self.c_row, self.scrolled);
+            self.c_row = 0;
+            self.adjust_col();
+        } else {
+            self.scrolled = 0;
+            self.c_row = 0;
+            self.adjust_col();
+        }
+    }
+
+    fn move_cursor_down(&mut self, amount: usize) {
+        if self.c_row + amount < self.c_row_max {
+            // No need to scroll
+            self.c_row += cmp::min(amount, self.buf.len() - (self.scrolled + self.c_row));
+            self.adjust_col();
+        } else {
+            let remaining_lines_in_file = self.buf.len() - (self.scrolled + self.c_row) - 1;
+            let lines_wanting_to_scroll = self.c_row + amount + 1 - self.c_row_max;
+            let lines_to_scroll = cmp::min(remaining_lines_in_file, lines_wanting_to_scroll);
+            if self.scrolled + self.c_row_max < self.buf.len() {
+                self.scrolled += lines_to_scroll;
+                let remaining_lines_in_file = self.buf.len() - (self.scrolled + self.c_row) - 1;
+                let lines_to_scroll = cmp::min(remaining_lines_in_file, lines_wanting_to_scroll);
+                self.c_row += cmp::min(amount - lines_to_scroll, remaining_lines_in_file);
+            } else {
+                self.c_row += cmp::min(amount - lines_to_scroll, remaining_lines_in_file);
+            }
+            self.adjust_col();
+        }
+    }
+
+    fn move_cursor_left(&mut self, amount: usize) {
+        self.c_col = cmp::max(self.c_col - amount, 0);
+    }
+
+    fn move_cursor_right(&mut self, amount: usize) {
+        self.c_col = cmp::min(
+            self.c_col + amount,
+            self.buf[self.c_row + self.scrolled].len(),
+        );
+    }
+
+    fn backspace(&mut self) {
+        if self.c_col > 0 {
+            self.push_hists();
+
+            let line: Vec<&str> =
+                UnicodeSegmentation::graphemes(&self.buf[(self.c_row + self.scrolled)][..], true)
+                    .collect();
+
+            let p1 = &line[..(self.c_col - 1)].join("");
+            let p2 = &line[self.c_col..].join("");
+
+            self.buf[(self.c_row + self.scrolled)] = p1.to_string() + p2;
+            self.c_col -= 1;
+        } else if self.c_col == 0
+            && self.c_row + self.scrolled > 0
+            && self.buf[(self.c_row + self.scrolled)].is_empty()
+        {
+            self.push_hists();
+
+            self.buf.remove(self.c_row + self.scrolled);
+            self.c_row -= 1;
+            self.c_col = self.buf[self.c_row + self.scrolled].len();
+        } else if self.c_col == 0 && self.c_row + self.scrolled > 0 {
+            self.push_hists();
+
+            let p = &self.buf[(self.c_row + self.scrolled)].clone();
+            self.c_col =
+                UnicodeSegmentation::graphemes(&self.buf[self.c_row + self.scrolled - 1][..], true)
+                    .count();
+            self.buf[(self.c_row + self.scrolled - 1)].push_str(p);
+            self.buf.remove(self.c_row + self.scrolled);
+            self.c_row -= 1;
+        }
+    }
+
+    fn enter(&mut self) {
+        if self.c_col == self.buf[self.c_row + self.scrolled].len() {
+            self.push_hists();
+
+            self.buf
+                .insert(self.c_row + 1 + self.scrolled, "".to_string());
+            if self.c_row < self.c_row_max - 1 {
+                self.c_row += 1;
+            } else {
+                self.scrolled += 1;
+            }
+            self.c_col = 0;
+        } else {
+            self.push_hists();
+
+            let line: Vec<&str> =
+                UnicodeSegmentation::graphemes(&self.buf[self.c_row + self.scrolled][..], true)
+                    .collect();
+            let p1 = &line[..self.c_col].join("");
+            let p2 = &line[self.c_col..].join("");
+
+            self.buf
+                .insert(self.c_row + 1 + self.scrolled, p2.to_string());
+            self.buf
+                .insert(self.c_row + 1 + self.scrolled, p1.to_string());
+            self.buf.remove(self.c_row + self.scrolled);
+            if self.c_row < self.c_row_max - 1 {
+                self.c_row += 1;
+            } else {
+                self.scrolled += 1;
+            }
+            self.c_col = 0;
+        }
+    }
+
+    fn undo(&mut self) {
+        match self.buf_hist.pop() {
+            Some(x) => {
+                self.buf = x;
+                (self.c_col, self.c_row, self.scrolled) = self.c_hist.pop().unwrap();
+                // Safe because c_hist is added to whenever buf_hist is
+            }
+            None => (),
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.push_hists();
+
+        let line: Vec<&str> =
+            UnicodeSegmentation::graphemes(&self.buf[self.c_row + self.scrolled][..], true)
+                .collect();
+        let p1 = &line[..self.c_col].join("");
+        let p2 = &line[self.c_col..].join("");
+        let p: String = p1.to_string() + &c.to_string() + p2;
+        self.buf[self.c_row + self.scrolled] = p;
+        self.c_col += 1;
+    }
+}
+
+fn run(filename: &str) -> Result<(), Box<dyn Error>> {
     enable_raw_mode()?;
     let mut backend = CrosstermBackend::new(io::stdout());
     execute!(backend, EnterAlternateScreen)?;
     let mut terminal = Terminal::new(backend)?;
 
-    let args: Vec<String> = env::args().collect();
-    let buffer = fs::read_to_string(&args[1])?;
-    let mut buf: Vec<String> = buffer.lines().map(|x| x.to_string()).collect();
-    let mut bufs: Vec<Vec<String>> = vec![];
+    let term_width = terminal.size()?.width;
 
-    let mut cursor_row: usize = 0;
-    let mut cursor_col: usize = 0;
+    let mut buf_state = BufState {
+        buf: fs::read_to_string(filename)?
+            .lines()
+            .map(|x| x.to_string())
+            .collect(),
+        buf_hist: vec![],
+        c_row: 0,
+        c_col: 0,
+        scrolled: 0,
+        c_hist: vec![],
+        c_row_max: terminal.size()?.height as usize - 2,
+    };
 
-    let mut v_scroll = 0;
-    let mut cursor_states: Vec<(usize, usize, usize)> = vec![];
-    let mut v_scroll_max = terminal.size()?.height as usize - 2;
-    let mut term_width = terminal.size()?.width;
-
-    let mut writing = false;
+    let mut should_write_to_file = false;
 
     loop {
         terminal.draw(|f| {
@@ -48,26 +209,26 @@ fn main() -> Result<(), io::Error> {
             let block_inner = block.inner(size);
             f.render_widget(block, size);
 
-            let line_numbers_width = (buffer.lines().count() as f32).log10() as usize + 2;
+            let line_numbers_width = (buf_state.buf.len() as f32).log10() as usize + 2;
             let mut lines_with_nums: Vec<Vec<String>> = vec![];
-            for i in v_scroll..buf.len() {
+            for (i, item) in buf_state.buf.iter().enumerate().skip(buf_state.scrolled) {
                 let overflow_indicator =
-                    if buf[i].len() > term_width as usize - 2 - line_numbers_width - 2 - 2 {
+                    if item.len() > term_width as usize - 2 - line_numbers_width - 2 - 2 {
                         ">>".to_string()
                     } else {
                         "".to_string()
                     };
                 lines_with_nums.push(vec![
                     format!("{:>line_numbers_width$}", i + 1),
-                    buf[i].clone(),
+                    item.clone(),
                     overflow_indicator,
                 ]);
             }
-            let rows = lines_with_nums.into_iter().map(|x| Row::new(x));
+            let rows = lines_with_nums.into_iter().map(Row::new);
 
             f.set_cursor(
-                (2 + line_numbers_width + cursor_col) as u16,
-                1 + cursor_row as u16,
+                (2 + line_numbers_width + buf_state.c_col) as u16,
+                1 + buf_state.c_row as u16,
             );
 
             f.render_widget(
@@ -91,127 +252,37 @@ fn main() -> Result<(), io::Error> {
             match code {
                 KeyCode::Esc => break,
                 KeyCode::Up => {
-                    if cursor_row > 0 {
-                        cursor_row -= 1;
-                        cursor_col = cmp::min(cursor_col, buf[cursor_row + v_scroll].len());
-                    } else if v_scroll > 0 {
-                        cursor_col = cmp::min(cursor_col, buf[cursor_row + v_scroll].len());
-                        v_scroll -= 1;
-                    }
+                    buf_state.move_cursor_up(1);
                 }
                 KeyCode::Down => {
-                    if cursor_row < v_scroll_max - 1 && cursor_row < buf.len() - 1 {
-                        cursor_row += 1;
-                        cursor_col = cmp::min(cursor_col, buf[cursor_row].len());
-                    } else if v_scroll <= buf.len() - 2
-                        && cursor_row == v_scroll_max - 1
-                        && cursor_row < buf.len() - 1
-                    {
-                        cursor_col = cmp::min(cursor_col, buf[cursor_row].len());
-                        v_scroll += 1;
-                    }
+                    buf_state.move_cursor_down(1);
                 }
                 KeyCode::Left => {
-                    if cursor_col > 0 {
-                        cursor_col -= 1;
-                    }
+                    buf_state.move_cursor_left(1);
                 }
                 KeyCode::Right => {
-                    if cursor_col < buf[cursor_row + v_scroll].len() {
-                        cursor_col += 1;
-                    }
+                    buf_state.move_cursor_right(1);
+                }
+                KeyCode::PageUp => {
+                    buf_state.move_cursor_up(10);
+                }
+                KeyCode::PageDown => {
+                    buf_state.move_cursor_down(10);
                 }
                 KeyCode::Backspace => {
-                    if cursor_col > 0 {
-                        bufs.push(buf.clone());
-                        cursor_states.push((cursor_col, cursor_row, v_scroll));
-
-                        let line: Vec<&str> =
-                            UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
-                                .collect();
-                        let p1 = &line[..cursor_col - 1].join("");
-                        let p2 = &line[cursor_col..].join("");
-                        buf[cursor_row + v_scroll] = p1.to_string() + p2;
-
-                        cursor_col -= 1;
-                    } else if cursor_col == 0
-                        && cursor_row + v_scroll > 0
-                        && buf[cursor_row + v_scroll].len() == 0
-                    {
-                        bufs.push(buf.clone());
-                        cursor_states.push((cursor_col, cursor_row, v_scroll));
-                        buf.remove(cursor_row + v_scroll);
-                        cursor_row -= 1;
-                        cursor_col = buf[cursor_row + v_scroll].len();
-                    } else if cursor_col == 0 && cursor_row + v_scroll > 0 {
-                        bufs.push(buf.clone());
-                        cursor_states.push((cursor_col, cursor_row, v_scroll));
-                        let p = &buf[cursor_row + v_scroll].clone();
-                        cursor_col = UnicodeSegmentation::graphemes(
-                            &buf[cursor_row + v_scroll - 1][..],
-                            true,
-                        )
-                        .collect::<Vec<&str>>()
-                        .len();
-                        buf[cursor_row + v_scroll - 1].push_str(p);
-                        buf.remove(cursor_row + v_scroll);
-                        cursor_row -= 1;
-                    }
+                    buf_state.backspace();
                 }
                 KeyCode::Enter => {
-                    if cursor_col == buf[cursor_row + v_scroll].len() {
-                        bufs.push(buf.clone());
-                        cursor_states.push((cursor_col, cursor_row, v_scroll));
-                        buf.insert(cursor_row + 1 + v_scroll, "".to_string());
-                        if cursor_row < v_scroll_max - 1 {
-                            cursor_row += 1;
-                        } else {
-                            v_scroll += 1;
-                        }
-                        cursor_col = 0;
-                    } else {
-                        bufs.push(buf.clone());
-                        cursor_states.push((cursor_col, cursor_row, v_scroll));
-                        let line: Vec<&str> =
-                            UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
-                                .collect();
-                        let p1 = &line[..cursor_col].join("");
-                        let p2 = &line[cursor_col..].join("");
-
-                        buf.insert(cursor_row + 1 + v_scroll, p2.to_string());
-                        buf.insert(cursor_row + 1 + v_scroll, p1.to_string());
-                        buf.remove(cursor_row + v_scroll);
-                        if cursor_row < v_scroll_max - 1 {
-                            cursor_row += 1;
-                        } else {
-                            v_scroll += 1;
-                        }
-                        cursor_col = 0;
-                    }
+                    buf_state.enter();
                 }
                 KeyCode::Char(c) => {
                     if _m == KeyModifiers::CONTROL && c == 's' {
-                        writing = true;
+                        should_write_to_file = true;
                         break;
                     } else if _m == KeyModifiers::CONTROL && c == 'z' {
-                        match bufs.pop() {
-                            Some(x) => {
-                                buf = x;
-                                (cursor_col, cursor_row, v_scroll) = cursor_states.pop().unwrap();
-                            }
-                            None => (),
-                        }
+                        buf_state.undo();
                     } else {
-                        bufs.push(buf.clone());
-                        cursor_states.push((cursor_col, cursor_row, v_scroll));
-                        let line: Vec<&str> =
-                            UnicodeSegmentation::graphemes(&buf[cursor_row + v_scroll][..], true)
-                                .collect();
-                        let p1 = &line[..cursor_col].join("");
-                        let p2 = &line[cursor_col..].join("");
-                        let p: String = p1.to_string() + &c.to_string() + p2;
-                        buf[cursor_row + v_scroll] = p;
-                        cursor_col += 1;
+                        buf_state.insert_char(c);
                     }
                 }
                 _ => continue,
@@ -219,12 +290,18 @@ fn main() -> Result<(), io::Error> {
         }
     }
 
-    if writing {
-        fs::write(&args[1], buf.join("\n"))?;
+    if should_write_to_file {
+        fs::write(filename, buf_state.buf.join("\n"))?;
     }
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     Ok(())
+}
+
+fn main() {
+    let filename = &env::args().collect::<Vec<String>>()[1];
+
+    run(filename).expect("Something went wrong!");
 }
