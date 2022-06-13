@@ -81,6 +81,31 @@ impl BufState {
         }
     }
 
+    fn redo(&mut self) {
+        if self.un_buf_i >= self.un_buf.len() {
+            return;
+        }
+
+        let UndoBufferEntry(l1o, l1n, l2o, l2n, cpo, cpn) = &self.un_buf[self.un_buf_i];
+
+        self.buf[l1n.0] = l1n.1.as_ref().unwrap().to_string();
+        self.c_row = cpn.0;
+        self.c_col = cpn.1;
+        self.scrolled = cpn.2;
+
+        if l1n.0 != l2n.0 {
+            match (&l2o.1, &l2n.1) {
+                (Some(x), None) => {
+                    self.buf.remove(l2n.0);
+                }
+                (None, Some(x)) => (self.buf.insert(l2n.0, x.to_string())),
+                _ => (),
+            }
+        }
+
+        self.un_buf_i += 1;
+    }
+
     fn move_cursor_up(&mut self, amount: usize) {
         if self.c_row >= amount {
             self.c_row -= amount;
@@ -184,10 +209,10 @@ impl BufState {
             self.c_col = self.buf[self.c_row + self.scrolled].len();
 
             let l1n = UndoBufferLine(
-                self.scrolled + self.c_row - 1,
-                Some(self.buf[self.scrolled + self.c_row - 1].clone()),
+                self.scrolled + self.c_row,
+                Some(self.buf[self.scrolled + self.c_row].clone()),
             );
-            let l2n = UndoBufferLine(self.scrolled + self.c_row, None);
+            let l2n = UndoBufferLine(self.scrolled + self.c_row + 1, None);
             let cpn = UndoBufferCurPos(self.c_row, self.c_col, self.scrolled);
             self.add_to_undo_buffer(l1o, l1n, l2o, l2n, cpo, cpn);
         } else if self.c_col == 0 && self.c_row + self.scrolled > 0 {
@@ -209,10 +234,10 @@ impl BufState {
             self.c_row -= 1;
 
             let l1n = UndoBufferLine(
-                self.scrolled + self.c_row - 1,
-                Some(self.buf[self.scrolled + self.c_row - 1].clone()),
+                self.scrolled + self.c_row,
+                Some(self.buf[self.scrolled + self.c_row].clone()),
             );
-            let l2n = UndoBufferLine(self.scrolled + self.c_row, None);
+            let l2n = UndoBufferLine(self.scrolled + self.c_row + 1, None);
             let cpn = UndoBufferCurPos(self.c_row, self.c_col, self.scrolled);
             self.add_to_undo_buffer(l1o, l1n, l2o, l2n, cpo, cpn);
         }
@@ -256,12 +281,12 @@ impl BufState {
         }
 
         let l1n = UndoBufferLine(
-            self.scrolled + self.c_row,
-            Some(self.buf[self.scrolled + self.c_row].clone()),
+            self.scrolled + self.c_row - 1,
+            Some(self.buf[self.scrolled + self.c_row - 1].clone()),
         );
         let l2n = UndoBufferLine(
-            self.scrolled + self.c_row + 1,
-            Some(self.buf[self.scrolled + self.c_row + 1].clone()),
+            self.scrolled + self.c_row + 0,
+            Some(self.buf[self.scrolled + self.c_row + 0].clone()),
         );
         let cpn = UndoBufferCurPos(self.c_row, self.c_col, self.scrolled);
         self.add_to_undo_buffer(l1o, l1n, l2o, l2n, cpo, cpn);
@@ -363,11 +388,7 @@ fn run(filename: &str) -> Result<(), Box<dyn Error>> {
             );
         })?;
 
-        if let Event::Key(KeyEvent {
-            code,
-            modifiers: _m,
-        }) = read()?
-        {
+        if let Event::Key(KeyEvent { code, modifiers: m }) = read()? {
             match code {
                 KeyCode::Esc => break,
                 KeyCode::Up => {
@@ -395,11 +416,13 @@ fn run(filename: &str) -> Result<(), Box<dyn Error>> {
                     buf_state.enter();
                 }
                 KeyCode::Char(c) => {
-                    if _m == KeyModifiers::CONTROL && c == 's' {
+                    if m == KeyModifiers::CONTROL && c == 's' {
                         should_write_to_file = true;
                         break;
-                    } else if _m == KeyModifiers::CONTROL && c == 'z' {
+                    } else if m == KeyModifiers::CONTROL && c == 'z' {
                         buf_state.undo();
+                    } else if m == KeyModifiers::CONTROL && c == 'y' {
+                        buf_state.redo();
                     } else {
                         buf_state.insert_char(c);
                     }
