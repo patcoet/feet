@@ -14,6 +14,17 @@ use tui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+struct UndoBufferLine(usize, Option<String>);
+struct UndoBufferCurPos(usize, usize, usize);
+struct UndoBufferEntry(
+    UndoBufferLine,
+    UndoBufferLine,
+    UndoBufferLine,
+    UndoBufferLine,
+    UndoBufferCurPos,
+    UndoBufferCurPos,
+);
+
 struct BufState {
     buf: Vec<String>,
     buf_hist: Vec<Vec<String>>,
@@ -22,11 +33,44 @@ struct BufState {
     scrolled: usize,
     c_hist: Vec<(usize, usize, usize)>,
     c_row_max: usize,
+    un_buf: Vec<UndoBufferEntry>,
+    un_buf_i: usize,
 }
+// Undo and redo: Have a vector of (operation, cursor and scroll position)?
+// When adding a character, add ((delete_character_at, c, r), (c, r, s))
+// When deleting, ((add_character_at, d, r), (c, r, s))
+// When undoing, go to undo_buffer[undo_index], apply the operation, move the cursor, and
+// undo_index -= 1
+// When redoing,
+//
+// Undo and redo: Keep a history, but of single lines instead of the whole file?
+// When adding a character, push (changed_line_number, old_line, cursor_position, false)
+// When adding a line, push (changed_line_number, old_line, cursor_position, true)
+// enum for like AddOrRemoveChar, AddLine, and RemoveLine
+// Or we always have (line1before, line1after, line2before, line2after, cursorpositionbefore,
+// cursorpositionafter)?
+// (4, Some "a"), (4, Some "aergw56"), (5, Some "ergw56"), (5, None), (5, 0, 0), (4, 1, 0)
+// (12, Some "aljsn"), (12, Some "alsn"), (12, Some "aljsn"), (12, Some "alsn"), (12, 4, 0), (12, 3,
+// 0)
 
 impl BufState {
     fn adjust_col(&mut self) {
         self.c_col = cmp::min(self.c_col, self.buf[self.c_row + self.scrolled].len());
+    }
+
+    fn add_to_undo_buffer(
+        &mut self,
+        l1o: UndoBufferLine,
+        l1n: UndoBufferLine,
+        l2o: UndoBufferLine,
+        l2n: UndoBufferLine,
+        cpo: UndoBufferCurPos,
+        cpn: UndoBufferCurPos,
+    ) {
+        self.un_buf.truncate(self.un_buf_i);
+        self.un_buf
+            .push(UndoBufferEntry(l1o, l1n, l2o, l2n, cpo, cpn));
+        self.un_buf_i += 1;
     }
 
     fn push_hists(&mut self) {
@@ -34,44 +78,95 @@ impl BufState {
         self.c_hist.push((self.c_col, self.c_row, self.scrolled));
     }
 
+    fn undo(&mut self) {
+        /*
+        match self.buf_hist.pop() {
+            Some(x) => {
+                self.buf = x;
+                (self.c_col, self.c_row, self.scrolled) = self.c_hist.pop().unwrap();
+                // Safe because c_hist is added to whenever buf_hist is
+            }
+            None => (),
+        }
+        */
+
+        if self.un_buf_i < 1 {
+            return;
+        }
+
+        self.un_buf_i -= 1;
+        let UndoBufferEntry(l1o, l1n, l2o, l2n, cpo, cpn) = &self.un_buf[self.un_buf_i];
+
+        self.buf[l1o.0] = l1o.1.as_ref().unwrap().to_string();
+        self.c_row = cpo.0;
+        self.c_col = cpo.1;
+        self.scrolled = cpo.2;
+
+        if l1o.0 != l2o.0 {
+            match (&l2o.1, &l2n.1) {
+                // We only get here if we're adding or removing a line, so we only have Some, None
+                // and None, Some to deal with
+                (Some(x), None) => self.buf.insert(l2o.0, x.to_string()),
+                (None, Some(_)) => {
+                    self.buf.remove(l2o.0);
+                }
+                _ => (),
+            }
+        }
+    }
+
     fn move_cursor_up(&mut self, amount: usize) {
         if self.c_row >= amount {
             self.c_row -= amount;
-            self.adjust_col();
         } else if self.scrolled + self.c_row >= amount {
             self.scrolled -= cmp::min(amount - self.c_row, self.scrolled);
             self.c_row = 0;
-            self.adjust_col();
         } else {
             self.scrolled = 0;
             self.c_row = 0;
-            self.adjust_col();
         }
+        self.adjust_col();
     }
 
     fn move_cursor_down(&mut self, amount: usize) {
-        if self.c_row + amount < self.c_row_max {
+        let curr_line = self.scrolled + self.c_row + 1;
+        let target_line = curr_line + amount;
+        let last_visible_line = self.scrolled + self.c_row_max;
+        let remaining_lines_in_file = self.buf.len() - curr_line;
+        if target_line <= last_visible_line {
             // No need to scroll
-            self.c_row += cmp::min(amount, self.buf.len() - (self.scrolled + self.c_row));
-            self.adjust_col();
+            self.c_row += amount;
         } else {
-            let remaining_lines_in_file = self.buf.len() - (self.scrolled + self.c_row) - 1;
-            let lines_wanting_to_scroll = self.c_row + amount + 1 - self.c_row_max;
-            let lines_to_scroll = cmp::min(remaining_lines_in_file, lines_wanting_to_scroll);
-            if self.scrolled + self.c_row_max < self.buf.len() {
-                self.scrolled += lines_to_scroll;
-                let remaining_lines_in_file = self.buf.len() - (self.scrolled + self.c_row) - 1;
-                let lines_to_scroll = cmp::min(remaining_lines_in_file, lines_wanting_to_scroll);
-                self.c_row += cmp::min(amount - lines_to_scroll, remaining_lines_in_file);
+            // Scroll and move cursor down if needed
+            // Cases:
+            // 1. Just scroll amount lines
+            // 2. Just scroll less than amount lines, because EOF
+            // 3. Scroll amount lines and move cursor, because cursor not at bottom when paging
+            //    down
+            // 4. Scroll less than amount lines and move cursor
+            if curr_line < last_visible_line {
+                // Cursor needs to be moved
+                let c_row_change = last_visible_line - curr_line;
+                let lines_to_scroll = cmp::min(remaining_lines_in_file, amount - c_row_change);
+                self.c_row += c_row_change;
+                if last_visible_line < self.buf.len() {
+                    self.scrolled += lines_to_scroll;
+                }
             } else {
-                self.c_row += cmp::min(amount - lines_to_scroll, remaining_lines_in_file);
+                // Just scroll
+                let lines_to_scroll = cmp::min(remaining_lines_in_file, amount);
+                self.scrolled += lines_to_scroll;
             }
-            self.adjust_col();
         }
+        self.adjust_col();
     }
 
     fn move_cursor_left(&mut self, amount: usize) {
-        self.c_col = cmp::max(self.c_col - amount, 0);
+        if amount <= self.c_col {
+            self.c_col -= amount;
+        } else {
+            self.c_col = 0;
+        }
     }
 
     fn move_cursor_right(&mut self, amount: usize) {
@@ -120,6 +215,10 @@ impl BufState {
         if self.c_col == self.buf[self.c_row + self.scrolled].len() {
             self.push_hists();
 
+            let l1o = UndoBufferLine(self.c_row, Some(self.buf[self.c_row].clone()));
+            let l2o = UndoBufferLine(self.c_row + 1, Some("".to_string()));
+            let cpo = UndoBufferCurPos(self.c_row, self.c_col, self.scrolled);
+
             self.buf
                 .insert(self.c_row + 1 + self.scrolled, "".to_string());
             if self.c_row < self.c_row_max - 1 {
@@ -151,19 +250,15 @@ impl BufState {
         }
     }
 
-    fn undo(&mut self) {
-        match self.buf_hist.pop() {
-            Some(x) => {
-                self.buf = x;
-                (self.c_col, self.c_row, self.scrolled) = self.c_hist.pop().unwrap();
-                // Safe because c_hist is added to whenever buf_hist is
-            }
-            None => (),
-        }
-    }
-
     fn insert_char(&mut self, c: char) {
         self.push_hists();
+
+        let l1o = UndoBufferLine(
+            self.scrolled + self.c_row,
+            Some(self.buf[self.scrolled + self.c_row].clone()),
+        );
+        let l2o = UndoBufferLine(self.scrolled + self.c_row, None);
+        let cpo = UndoBufferCurPos(self.c_row, self.c_col, self.scrolled);
 
         let line: Vec<&str> =
             UnicodeSegmentation::graphemes(&self.buf[self.c_row + self.scrolled][..], true)
@@ -173,6 +268,15 @@ impl BufState {
         let p: String = p1.to_string() + &c.to_string() + p2;
         self.buf[self.c_row + self.scrolled] = p;
         self.c_col += 1;
+
+        let l1n = UndoBufferLine(
+            self.scrolled + self.c_row,
+            Some(self.buf[self.c_row].clone()),
+        );
+        let l2n = UndoBufferLine(self.scrolled + self.c_row, None);
+        let cpn = UndoBufferCurPos(self.c_row, self.c_col, self.scrolled);
+
+        self.add_to_undo_buffer(l1o, l1n, l2o, l2n, cpo, cpn);
     }
 }
 
@@ -195,6 +299,8 @@ fn run(filename: &str) -> Result<(), Box<dyn Error>> {
         scrolled: 0,
         c_hist: vec![],
         c_row_max: terminal.size()?.height as usize - 2,
+        un_buf: vec![],
+        un_buf_i: 0,
     };
 
     let mut should_write_to_file = false;
